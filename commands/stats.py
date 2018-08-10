@@ -1,6 +1,7 @@
 import json
 import itertools
 import os.path
+import urllib.parse
 from os import listdir
 from collections import OrderedDict
 import pyjq
@@ -102,7 +103,8 @@ resources = OrderedDict([
     ('cloudfront', {
 		'name': 'CloudFronts',
 		'query': '.DistributionList|length',
-		'source': 'cloudfront-list-distributions'}),
+		'source': 'cloudfront-list-distributions',
+		'region': 'us-east-1'}),
     ('cloudsearch', {
 		'name': 'CloudSearch domains',
 		'query': '.DomainStatusList|length',
@@ -175,6 +177,10 @@ def get_account_stats(account):
         region = Region(account, region_json)
 
         for key, resource in resources.items():
+            # Skip global services (just CloudFront)
+            if ('region' in resource) and (resource['region'] != region.name):
+                continue
+
             # Check exceptions that require special code to perform the count
             if key == 'route53_record':
                 path = 'account-data/{}/{}/{}'.format(
@@ -184,7 +190,7 @@ def get_account_stats(account):
                 if os.path.isdir(path):
                     stats[key][region.name] = 0
                     for f in listdir(path):
-                        json_data = json.load(open(os.path.join(path, f)))
+                        json_data = json.load(open(os.path.join(path, urllib.parse.quote_plus(f))))
                         stats[key][region.name] += sum(pyjq.all('.ResourceRecordSets|length', json_data))
             else:
                 # Normal path
@@ -203,7 +209,7 @@ def stats(accounts, config):
         account_stats[account['name']] = get_account_stats(account)
 
     # Print header
-    print ('\t' + '\t'.join(a['name'] for a in accounts))
+    print('\t' + '\t'.join(a['name'] for a in accounts))
 
     for resource in resources:
         output_line = resources[resource]['name'].ljust(20)

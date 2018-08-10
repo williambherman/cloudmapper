@@ -2,8 +2,10 @@ from __future__ import print_function
 import sys
 import json
 import pyjq
-from shared.common import parse_arguments
+from shared.common import parse_arguments, query_aws, get_regions
+from shared.nodes import Account, Region
 from commands.prepare import build_data_structure
+
 
 __description__ = "Find publicly exposed services and their ports"
 
@@ -73,7 +75,7 @@ def log_warning(msg):
 def public(accounts, config):
     for account in accounts:
         # Get the data from the `prepare` command
-        outputfilter = {'internal_edges': False, 'read_replicas': False, 'inter_rds_edges': False, 'azs': False, 'collapse_by_tag': None, 'mute': True}
+        outputfilter = {'internal_edges': False, 'read_replicas': False, 'inter_rds_edges': False, 'azs': False, 'collapse_by_tag': None, 'collapse_asgs': True, 'mute': True}
         network = build_data_structure(account, config, outputfilter)
 
         # Look at all the edges for ones connected to the public Internet (0.0.0.0/0)
@@ -103,23 +105,60 @@ def public(accounts, config):
                 print(pyjq.first('.[].data|select(.id=="{}")|[.type, (.node_data|keys)]'.format(target['arn']), network, {}))
 
             # Check if any protocol is allowed (indicated by IpProtocol == -1)
-            ingress = pyjq.all('.[].IpPermissions[]', edge.get('node_data', {}))
-            if pyjq.first('.[]|select(.IpProtocol=="-1")|.IpProtocol', ingress, '1') == '-1':
-                log_warning('All protocols allowed access to {}'.format(target))
+            ingress = pyjq.all('.[]', edge.get('node_data', {}))
+
+            sg_group_allowing_all_protocols = pyjq.first('select(.IpPermissions[]|.IpProtocol=="-1")|.GroupId', ingress, None)
+            public_sgs = set()
+            if sg_group_allowing_all_protocols is not None:
+                log_warning('All protocols allowed access to {} due to {}'.format(target, sg_group_allowing_all_protocols))
                 range_string = '0-65535'
+                public_sgs.add(sg_group_allowing_all_protocols)
             else:
                 # from_port and to_port mean the beginning and end of a port range
                 # We only care about TCP (6) and UDP (17)
                 # For more info see https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/security-group-rules-reference.html
-                selection = 'select((.IpProtocol=="tcp") or (.IpProtocol=="udp")) | select(.IpRanges[].CidrIp=="0.0.0.0/0")'
-                port_ranges = pyjq.all('.[]|{}| [.FromPort,.ToPort]'.format(selection), ingress)
+                port_ranges = []
+                for sg in ingress:
+                    for ip_permission in sg['IpPermissions']:
+                        selection = 'select((.IpProtocol=="tcp") or (.IpProtocol=="udp")) | select(.IpRanges[].CidrIp=="0.0.0.0/0")'
+                        port_ranges.extend(pyjq.all('{}| [.FromPort,.ToPort]'.format(selection), ip_permission))
+                        public_sgs.add(sg['GroupId'])
                 range_string = port_ranges_string(regroup_ranges(port_ranges))
 
             target['ports'] = range_string
+            target['public_sgs'] = list(public_sgs)
             if target['ports'] == "":
                 issue_msg = 'No ports open for tcp or udp (probably can only be pinged). Rules that are not tcp or udp: {} -- {}'
                 log_warning(issue_msg.format(json.dumps(pyjq.all('.[]|select((.IpProtocol!="tcp") and (.IpProtocol!="udp"))'.format(selection), ingress)), account))
             print(json.dumps(target, indent=4, sort_keys=True))
+        
+        account = Account(None, account)
+        for region_json in get_regions(account):
+            region = Region(account, region_json)
+            # Look for CloudFront
+            if region.name == 'us-east-1':
+                json_blob = query_aws(region.account, 'cloudfront-list-distributions', region)
+
+                for distribution in json_blob.get('DistributionList', {}).get('Items', []):
+                    if not distribution['Enabled']:
+                        continue
+
+                    target = {'arn': distribution['ARN'], 'account': account.name}
+                    target['type'] = 'cloudfront'
+                    target['hostname'] = distribution['DomainName']
+                    target['ports'] = '80,443'
+
+                    print(json.dumps(target, indent=4, sort_keys=True))
+            
+            # Look for API Gateway
+            json_blob = query_aws(region.account, 'apigateway-get-rest-apis', region)
+            for api in json_blob.get('items', []):
+                target = {'arn': api['id'], 'account': account.name}
+                target['type'] = 'apigateway'
+                target['hostname'] = '{}.execute-api.{}.amazonaws.com'.format(api['id'], region.name)
+                target['ports'] = '80,443'
+
+                print(json.dumps(target, indent=4, sort_keys=True))
 
 
 def run(arguments):

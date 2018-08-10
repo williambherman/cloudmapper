@@ -1,13 +1,16 @@
+
 import os.path
 import os
 import argparse
 from shutil import rmtree
+import logging
 import json
 import boto3
 import yaml
 import pyjq
+import urllib.parse
 from botocore.exceptions import ClientError, EndpointConnectionError
-from shared.common import get_account, datetime_handler
+from shared.common import get_account, custom_serializer
 
 __description__ = "Run AWS API calls to collect data from the account"
 
@@ -28,7 +31,7 @@ def get_filename_from_parameter(parameter):
     else:
         filename = parameter
 
-    return filename.replace('/', '-')
+    return urllib.parse.quote_plus(filename)
 
 def make_directory(path):
     try:
@@ -81,10 +84,11 @@ def call_function(outputfile, handler, method_to_call, parameters):
         data.pop('IsTruncated', None)
 
     with open(outputfile, 'w+') as f:
-        f.write(json.dumps(data, indent=4, sort_keys=True, default=datetime_handler))
+        f.write(json.dumps(data, indent=4, sort_keys=True, default=custom_serializer))
 
 
 def collect(arguments):
+    logging.getLogger('botocore').setLevel(logging.WARN)
     account_dir = './{}'.format(arguments.account_name)
 
     if arguments.clean and os.path.exists(account_dir):
@@ -100,6 +104,23 @@ def collect(arguments):
         session_data['profile_name'] = arguments.profile_name
 
     session = boto3.Session(**session_data)
+
+    # Ensure we can make iam calls
+    iam = session.client('iam')
+    try:
+        iam.get_user(UserName='test')
+    except ClientError as e:
+        if 'InvalidClientTokenId' in str(e):
+            print("ERROR: AWS doesn't allow you to make IAM calls without MFA, and the collect command gathers IAM data.  Please use MFA.")
+            exit(-1)
+        if 'NoSuchEntity' in str(e):
+            # Ignore, we're just testing that our creds work
+            pass
+        else:
+            print("ERROR: Ensure your creds are valid.")
+            print(e)
+            exit(-1)
+
     ec2 = session.client('ec2')
 
     region_list = ec2.describe_regions()
